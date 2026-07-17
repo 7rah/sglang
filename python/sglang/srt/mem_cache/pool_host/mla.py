@@ -62,6 +62,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        is_dummy: bool = False,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -73,7 +74,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            is_dummy=is_dummy,
         )
+        # Dummy pools: no kv_buffer, skip per-layer view/ptr + staging init.
+        if self._is_dummy:
+            self.can_use_jit = False
+            self.data_refs = None
+            self.data_ptrs = None
+            self.token_stride_size = 0
+            self.layout_dim = 0
+            return
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
@@ -117,6 +127,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
+        if getattr(self, "_is_dummy", False):
+            return None
         if self.layout == "layer_first":
             dims = (
                 self.layer_num,

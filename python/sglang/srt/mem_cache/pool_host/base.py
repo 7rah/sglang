@@ -90,6 +90,7 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -98,9 +99,22 @@ class HostKVCache(abc.ABC):
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
+        # _is_dummy: non-src MLA dedup rank -- allocator-only, no host buffer.
+        # Controller skips storage registration (getattr _is_dummy) and all
+        # D2H/L3 I/O (_mla_skip_host_io); dummy pools are never alloc'd.
+        self._is_dummy = is_dummy
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        if is_dummy:
+            self.size = 0
+            self.page_num = 0
+            self.start_layer = device_pool.start_layer
+            self.end_layer = device_pool.end_layer
+            self.kv_buffer = None
+            self.lock = threading.RLock()
+            self.clear()
+            return
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size

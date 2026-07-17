@@ -1150,16 +1150,33 @@ class HiRadixCache(RadixCache):
                 node.release_host()
             staged.clear()
 
+        # MLA host dedup: dummy (non-src) ranks have no host pool, so
+        # write_backup() always returns 0. Fall back to the write-through
+        # path: free device slots directly without host backup, since these
+        # ranks receive KV via NCCL broadcast, not from a local host pool.
+        # ponytail: ceiling -- dummy ranks lose prefix-cache continuity on
+        # evicted nodes; acceptable because the src rank still owns the host
+        # copy and re-broadcasts on load_back.
+        is_dummy_rank = getattr(
+            self.cache_controller, "_mla_skip_host_io", False
+        )
+
         while num_evicted < num_tokens and heap:
             _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
-            elif self.write_backup(x, write_back=True) > 0:
+            elif not is_dummy_rank and self.write_backup(x, write_back=True) > 0:
                 x.protect_host()
                 staged.append((x, x.value))
                 num_evicted += self._detach_backuped(x)
+            elif is_dummy_rank:
+                # Dummy rank: no host pool, free device directly like
+                # write_through. Avoids _drop_subtree_no_host, which blocks
+                # indefinitely when host_ref_counter > 0.
+                flush_staged()
+                num_evicted += self._evict_regular(x)
             else:
                 flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)

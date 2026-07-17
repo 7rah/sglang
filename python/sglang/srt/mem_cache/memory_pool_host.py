@@ -1676,6 +1676,7 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
@@ -1687,6 +1688,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         self.layer_num = self._effective_host_layer_num()
+        self._is_dummy = is_dummy
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
@@ -1706,6 +1708,19 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
+
+        # Dummy indexer pool: allocator-only, no host buffer. Non-src dedup
+        # ranks receive indexer pages via NCCL broadcast, never read L3.
+        if is_dummy:
+            self.index_k_with_scale_buffer = None
+            self.index_k_data_refs = None
+            self.index_k_data_ptrs = None
+            self.index_k_device_ptrs = None
+            self.can_use_jit = False
+            self.can_use_write_back_jit = False
+            self.lock = threading.RLock()
+            self.clear()
+            return
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
