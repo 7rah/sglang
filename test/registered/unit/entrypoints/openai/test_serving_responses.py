@@ -700,6 +700,50 @@ class InputItemNormalizationTestCase(CustomTestCase):
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
 
+    def test_agent_message_becomes_user_message_with_routing_header(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "agent_message",
+                "id": "amsg_1",
+                "author": "/root/researcher",
+                "recipient": "/root",
+                "content": [
+                    {"type": "input_text", "text": "subagent result"},
+                    {"type": "encrypted_content", "encrypted_content": "plain reply"},
+                ],
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "user",
+                "content": "[agent message from /root/researcher to /root]\n"
+                "subagent result\nplain reply",
+            },
+        )
+
+    def test_agent_message_encrypted_blob_becomes_placeholder(self):
+        blob = "QWJj" * 100
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "agent_message",
+                "author": "/root/researcher",
+                "content": [
+                    {"type": "encrypted_content", "encrypted_content": blob},
+                ],
+            }
+        )
+        self.assertNotIn(blob, normalized["content"])
+        self.assertIn(
+            "[encrypted agent message content unavailable]", normalized["content"]
+        )
+
+    def test_empty_agent_message_is_dropped(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {"type": "agent_message", "content": []}
+        )
+        self.assertIsNone(normalized)
+
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
             OpenAIServingResponses._normalize_response_message_for_chat(

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
@@ -1329,6 +1330,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             ],
         }
 
+    @staticmethod
+    def _looks_like_encrypted_blob(text: str) -> bool:
+        """Heuristic for ciphertext in an ``encrypted_content`` part: one long
+        unbroken base64-ish token. Plaintext prose (spaces, punctuation)
+        never matches."""
+        return len(text) > 256 and re.fullmatch(r"[A-Za-z0-9+/=_\-]+", text) is not None
+
     @classmethod
     def _normalize_response_message_for_chat(cls, message: Any) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
@@ -1381,6 +1389,40 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "tool_call_id": message.get("call_id"),
                 "content": cls._flatten_tool_output(message.get("output", "")),
             }
+        if msg_type == "agent_message":
+            # Inter-agent message from a Codex multi-agent thread. OpenAI may
+            # emit plaintext or encrypted content; only the plaintext is useful
+            # to a non-OpenAI backend, so preserve it with a routing header.
+            content = message.get("content")
+            if isinstance(content, str):
+                content = [{"type": "input_text", "text": content}]
+            texts: list[str] = []
+            for part in content or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "input_text":
+                    text = part.get("text") or ""
+                elif part.get("type") == "encrypted_content":
+                    text = part.get("encrypted_content") or ""
+                    if cls._looks_like_encrypted_blob(text):
+                        text = "[encrypted agent message content unavailable]"
+                else:
+                    continue
+                if text:
+                    texts.append(text)
+            if not texts:
+                return None
+            author = message.get("author") or (message.get("agent") or {}).get(
+                "agent_name"
+            )
+            recipient = message.get("recipient")
+            header = "[agent message"
+            if author:
+                header += f" from {author}"
+            if recipient:
+                header += f" to {recipient}"
+            header += "]"
+            return {"role": "user", "content": header + "\n" + "\n".join(texts)}
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
         if msg_type == "reasoning":
