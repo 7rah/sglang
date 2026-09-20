@@ -61,6 +61,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponseNamespacedFunctionToolCall,
     ResponseOutputMessage,
     ResponsesRequest,
     ResponsesResponse,
@@ -924,7 +925,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _make_tool_call_item(
-        name: str, arguments: str, custom_names: set[str]
+        name: str, arguments: str, custom_names: set[str], namespace_names: set[str]
     ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
         """A call against a ``custom`` tool reports its freeform payload rather
         than the JSON arguments of the shim function tool."""
@@ -936,6 +937,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 call_id=call_id,
                 name=name,
                 input=decode_custom_tool_input(arguments),
+            )
+        local_name, namespace = OpenAIServingResponses._split_namespaced_name(
+            name, namespace_names
+        )
+        if namespace:
+            return ResponseNamespacedFunctionToolCall(
+                arguments=arguments,
+                call_id=call_id,
+                type="function_call",
+                name=local_name,
+                id=f"fc_{random_uuid()[:8]}",
+                status="completed",
+                namespace=namespace,
             )
         return ResponseFunctionToolCall(
             arguments=arguments,
@@ -1066,6 +1080,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         custom_names = custom_tool_names(request.tools)
+        namespace_names = self._namespace_names(request)
         tool_call_items: list[
             Union[ResponseFunctionToolCall, ResponseCustomToolCall]
         ] = []
@@ -1093,6 +1108,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 call_info.name,
                                 call_info.parameters or "",
                                 custom_names,
+                                namespace_names,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -1119,7 +1135,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                         tool_call_items.append(
                             self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
+                                tool["name"], arguments, custom_names, namespace_names
                             )
                         )
                     content = ""
@@ -1184,6 +1200,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
         chat_tools = []
+        names = set()
         for tool in request.tools:
             if tool.type == "function":
                 description, parameters = tool.description, tool.parameters
@@ -1192,6 +1209,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 parameters = custom_tool_parameters()
             else:
                 continue
+            if tool.name in names:
+                raise ValueError(f"Ambiguous function tool name: {tool.name!r}")
+            names.add(tool.name)
             chat_tools.append(
                 Tool(
                     type="function",
@@ -1203,7 +1223,46 @@ class OpenAIServingResponses(OpenAIServingChat):
                     ),
                 )
             )
+        for tool in request.tools:
+            if tool.type != "namespace":
+                continue
+            for member in tool.tools or []:
+                if member.get("type") != "function":
+                    continue
+                name = f"{tool.name}.{member['name']}"
+                if name in names:
+                    raise ValueError(f"Ambiguous function tool name: {name!r}")
+                names.add(name)
+                chat_tools.append(
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=name,
+                            description=(
+                                member.get("description") or tool.description or ""
+                            ),
+                            parameters=member.get("parameters"),
+                            strict=member.get("strict", False),
+                        ),
+                    )
+                )
         return chat_tools
+
+    @staticmethod
+    def _namespace_names(request: ResponsesRequest) -> set[str]:
+        return {
+            tool.name
+            for tool in (request.tools or [])
+            if tool.type == "namespace" and tool.name
+        }
+
+    @staticmethod
+    def _split_namespaced_name(name: str, namespace_names: set[str]) -> tuple[str, Optional[str]]:
+        if "." in name:
+            prefix, _, suffix = name.partition(".")
+            if suffix and prefix in namespace_names:
+                return suffix, prefix
+        return name, None
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
@@ -1305,7 +1364,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
                 raw = "{}"
-            return cls._chat_tool_call_message(message, message.get("name"), raw)
+            name = message.get("name")
+            if message.get("namespace") and name:
+                name = f"{message['namespace']}.{name}"
+            return cls._chat_tool_call_message(message, name, raw)
         if msg_type == "custom_tool_call":
             # Replay through the same single-string shim the tool was offered as.
             return cls._chat_tool_call_message(
@@ -2001,6 +2063,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
+        namespace_names = self._namespace_names(request)
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
@@ -2244,13 +2307,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             else:
-                completed_item = ResponseFunctionToolCall(
-                    arguments=arguments,
-                    call_id=state["call_id"],
-                    name=state["name"] or "",
-                    type="function_call",
-                    id=state["item_id"],
-                    status="completed",
+                local_name, namespace = self._split_namespaced_name(
+                    state["name"] or "", namespace_names
+                )
+                completed_item = (
+                    ResponseNamespacedFunctionToolCall(
+                        arguments=arguments,
+                        call_id=state["call_id"],
+                        type="function_call",
+                        name=local_name,
+                        id=state["item_id"],
+                        status="completed",
+                        namespace=namespace,
+                    )
+                    if namespace
+                    else ResponseFunctionToolCall(
+                        arguments=arguments,
+                        call_id=state["call_id"],
+                        name=state["name"] or "",
+                        type="function_call",
+                        id=state["item_id"],
+                        status="completed",
+                    )
                 )
                 events.append(
                     _send_event(
@@ -2260,20 +2338,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                             item_id=state["item_id"],
                             output_index=state["output_index"],
                             arguments=arguments,
-                            name=state["name"] or "",
+                            name=local_name,
                         )
                     )
                 )
-            events.append(
-                _send_event(
-                    openai_responses_types.ResponseOutputItemDoneEvent(
-                        type="response.output_item.done",
-                        sequence_number=-1,
-                        output_index=state["output_index"],
-                        item=completed_item,
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseOutputItemDoneEvent(
+                            type="response.output_item.done",
+                            sequence_number=-1,
+                            output_index=state["output_index"],
+                            item=completed_item,
+                        )
                     )
                 )
-            )
             emitted_items.append(completed_item)
             state["done"] = True
             return events
@@ -2457,13 +2535,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     input="",
                                 )
                             else:
-                                added_item = ResponseFunctionToolCall(
-                                    arguments="",
-                                    call_id=state["call_id"],
-                                    name=state["name"],
-                                    type="function_call",
-                                    id=state["item_id"],
-                                    status="in_progress",
+                                local_name, namespace = self._split_namespaced_name(
+                                    state["name"], namespace_names
+                                )
+                                added_item = (
+                                    ResponseNamespacedFunctionToolCall(
+                                        arguments="",
+                                        call_id=state["call_id"],
+                                        type="function_call",
+                                        name=local_name,
+                                        id=state["item_id"],
+                                        status="in_progress",
+                                        namespace=namespace,
+                                    )
+                                    if namespace
+                                    else ResponseFunctionToolCall(
+                                        arguments="",
+                                        call_id=state["call_id"],
+                                        name=state["name"],
+                                        type="function_call",
+                                        id=state["item_id"],
+                                        status="in_progress",
+                                    )
                                 )
                             yield _send_event(
                                 openai_responses_types.ResponseOutputItemAddedEvent(
@@ -2497,6 +2590,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         )
                                     )
                             else:
+                                local_name, _ = self._split_namespaced_name(
+                                    state["name"], namespace_names
+                                )
                                 yield _send_event(
                                     openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
                                         type="response.function_call_arguments.delta",
@@ -2504,6 +2600,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         item_id=state["item_id"],
                                         output_index=state["output_index"],
                                         delta=call.parameters,
+                                        name=local_name,
                                     )
                                 )
 
